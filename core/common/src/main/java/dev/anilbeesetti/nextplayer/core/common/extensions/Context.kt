@@ -26,7 +26,9 @@ import java.io.InputStream
 import java.net.URL
 import java.nio.charset.Charset
 import java.nio.charset.StandardCharsets
+import java.security.MessageDigest
 import java.util.concurrent.atomic.AtomicInteger
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
@@ -298,6 +300,75 @@ suspend fun Context.convertToUTF8(uri: Uri, charset: Charset? = null): Uri = wit
         exception.printStackTrace()
         uri
     }
+}
+
+/**
+ * Converts the subtitle at [uri] to UTF-8, reading its bytes through [openInputStream] instead of the
+ * [android.content.ContentResolver].
+ *
+ * Callers that hold their own client for a subtitle URI — the network sessions that also play the
+ * video — cannot use [convertToUTF8] with a charset, because a custom scheme such as `smb://` is not
+ * something the ContentResolver can open. They pass a provider instead.
+ *
+ * The provider contract is:
+ * - it may be invoked more than once: once for charset detection and, only when the content is not
+ *   already UTF-8, once more to stream the conversion;
+ * - every invocation must return a fresh stream at the start of the subtitle, because the detection
+ *   pass closes the stream it was given.
+ *
+ * Detection reads only the same 100 KB sample the other conversion paths use, and conversion is
+ * streamed straight to a cache file, so the subtitle is never held in memory. Content that is already
+ * UTF-8 is returned as the original [uri] with no cache file. A provider that fails, or a detection
+ * or conversion that fails, also returns the original [uri]: a subtitle that cannot be converted must
+ * never keep its video from playing.
+ */
+suspend fun Context.convertToUTF8(
+    uri: Uri,
+    charset: Charset? = null,
+    openInputStream: suspend () -> InputStream,
+): Uri = withContext(Dispatchers.IO) {
+    runCatching {
+        val detectedCharset = charset ?: openInputStream().use { detectCharsetFromStream(it) }
+        if (detectedCharset == StandardCharsets.UTF_8) {
+            uri
+        } else {
+            writeUtf8SubtitleCache(uri = uri, sourceCharset = detectedCharset, openInputStream = openInputStream)
+        }
+    }.getOrElse { if (it is CancellationException) throw it else uri }
+}
+
+private suspend fun Context.writeUtf8SubtitleCache(
+    uri: Uri,
+    sourceCharset: Charset,
+    openInputStream: suspend () -> InputStream,
+): Uri {
+    val file = subtitleCacheFileFor(uri)
+
+    openInputStream().use { inputStream ->
+        inputStream.reader(sourceCharset).buffered().use { reader ->
+            file.outputStream().writer(StandardCharsets.UTF_8).buffered().use { writer ->
+                reader.copyTo(writer)
+            }
+        }
+    }
+
+    return Uri.fromFile(file)
+}
+
+/**
+ * Cache name for a converted subtitle.
+ *
+ * The name is keyed by the whole source URI, not only by its file name, because the same file name
+ * exists on many shares: `smb://server-a/Movie.srt` and `smb://server-b/Movie.srt` are different
+ * subtitles and must not share (or overwrite) one cache file.
+ */
+private fun Context.subtitleCacheFileFor(uri: Uri): File {
+    val cacheKey = MessageDigest.getInstance("SHA-256")
+        .digest(uri.toString().toByteArray(StandardCharsets.UTF_8))
+        .take(12)
+        .joinToString("") { "%02x".format(it) }
+
+    return File(subtitleCacheDir, "$cacheKey-${getFilenameFromUri(uri)}")
 }
 
 private fun detectCharset(uri: Uri, context: Context): Charset {
