@@ -6,6 +6,7 @@ import dev.anilbeesetti.nextplayer.core.model.NetworkFile
 import java.io.InputStream
 import javax.inject.Inject
 import javax.inject.Singleton
+import kotlinx.coroutines.CancellationException
 
 /**
  * Finds the subtitle files that sit next to a network video.
@@ -31,6 +32,10 @@ class NetworkSubtitleResolver @Inject constructor(
      * exactly like the video ignoring case, and ends in one of [SUPPORTED_EXTENSIONS]. Language
      * suffixed names such as `Movie.en.srt` are not matched: which language the user wants is
      * decided later, by the subtitle that is actually opened.
+     *
+     * Only discovery failures are contained. Cancellation is rethrown: a player that stopped playing
+     * this video is not a server that had no subtitles to offer, and swallowing it would leave the
+     * caller running on a cancelled scope.
      */
     suspend fun findAdjacentSubtitles(videoUri: Uri): List<Uri> = runCatching {
         sessions.withTarget(videoUri) { connection, client, videoPath ->
@@ -49,7 +54,7 @@ class NetworkSubtitleResolver @Inject constructor(
                 .distinct()
                 .toList()
         }
-    }.getOrDefault(emptyList())
+    }.getOrElse { if (it is CancellationException) throw it else emptyList() }
 
     /**
      * Opens the subtitle at [uri] through the client already playing its video.

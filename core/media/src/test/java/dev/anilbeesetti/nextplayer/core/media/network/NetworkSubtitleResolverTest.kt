@@ -9,11 +9,17 @@ import java.io.ByteArrayInputStream
 import java.io.IOException
 import java.io.InputStream
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.awaitCancellation
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotSame
 import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
@@ -28,6 +34,7 @@ import org.robolectric.RobolectricTestRunner
  * built on top of it, which lists the video's own folder and has to stay quiet when it cannot.
  */
 @RunWith(RobolectricTestRunner::class)
+@OptIn(ExperimentalCoroutinesApi::class)
 class NetworkSubtitleResolverTest {
 
     private val videoConnection = NetworkConnection(
@@ -259,6 +266,27 @@ class NetworkSubtitleResolverTest {
     }
 
     @Test
+    fun `a lookup cancelled while its listing is in flight propagates the cancellation`() = runTest {
+        sessions.target(videoUri)
+        factory.clients.single().listFilesSuspendsForever = true
+        var returned = false
+
+        val lookup = launch {
+            resolver.findAdjacentSubtitles(videoUri)
+            returned = true
+        }
+        runCurrent()
+        assertEquals(
+            "the lookup has to be inside the listing before it is cancelled",
+            listOf("Movies"),
+            factory.clients.single().listedPaths,
+        )
+        lookup.cancelAndJoin()
+
+        assertFalse("a cancelled lookup must not finish with an empty subtitle list", returned)
+    }
+
+    @Test
     fun `an openStream failure reaches its caller and leaves discovery working`() = runTest {
         factory.files = listOf(NetworkFile("Movie.srt", "Movies/Movie.srt", false))
         val subtitle = resolver.findAdjacentSubtitles(videoUri).single()
@@ -328,6 +356,9 @@ class FakeNetworkClient(
     /** Fails every [openStream], the way an unreadable subtitle would. */
     var openStreamFails = false
 
+    /** Leaves the listing suspended until its caller is cancelled, for pinning cancellation. */
+    var listFilesSuspendsForever = false
+
     private var connected = false
 
     override fun isConnected(): Boolean = connected
@@ -350,6 +381,7 @@ class FakeNetworkClient(
     override suspend fun listFiles(path: String): Result<List<NetworkFile>> {
         listFilesCalls++
         listedPaths += path
+        if (listFilesSuspendsForever) awaitCancellation()
         return if (listFilesFails) {
             Result.failure(IOException("listing failed for $path"))
         } else {
