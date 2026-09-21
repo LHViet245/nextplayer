@@ -37,10 +37,29 @@ class NetworkSessions @Inject constructor(
     private var connection: NetworkConnection? = null
     private var client: NetworkClient? = null
 
+    /**
+     * Resolves [uri] to a connected client, reusing the current one when it already fits, and runs
+     * [block] with that client and the path to read on it.
+     *
+     * The connection is resolved and the client acquired or reused under the session lock, but
+     * [block] runs after the lock is released: reading over the network is slow, and holding the
+     * lock across it would stall every other session call — including a block that asks the session
+     * for another file on the same connection.
+     */
+    suspend fun <T> withTarget(
+        uri: Uri,
+        block: suspend (NetworkConnection, NetworkClient, String) -> T,
+    ): T {
+        val resolved = mutex.withLock {
+            val target = resolve(uri)
+            Triple(target.connection, clientFor(target.connection), target.filePath)
+        }
+        return block(resolved.first, resolved.second, resolved.third)
+    }
+
     /** Resolves [uri] to a connected client, reusing the current one when it already fits. */
-    suspend fun target(uri: Uri): NetworkTarget = mutex.withLock {
-        val target = resolve(uri)
-        NetworkTarget(clientFor(target.connection), target.filePath)
+    suspend fun target(uri: Uri): NetworkTarget = withTarget(uri) { _, client, filePath ->
+        NetworkTarget(client, filePath)
     }
 
     /** Disconnects the active client. The cache stays usable — the next [target] reconnects. */
