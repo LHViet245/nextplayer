@@ -33,6 +33,7 @@ import org.junit.rules.TemporaryFolder
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.RuntimeEnvironment
+import org.robolectric.Shadows
 
 /**
  * Which subtitles a media item gets, and in what order, decides what the user sees in the player's
@@ -154,6 +155,39 @@ class MediaItemSubtitleResolverTest {
             "the client playing the video is reused rather than connected again",
             1,
             factory.clients.single().connectCalls,
+        )
+    }
+
+    @Test
+    fun `a local subtitle saved for a network video keeps the local conversion path`() = runBlocking {
+        factory.files = listOf(NetworkFile("Movie.srt", "Movies/Movie.srt", false))
+        factory.content = SUBRIP_UTF8.toByteArray(StandardCharsets.UTF_8)
+        // A subtitle picked from this device for a video that lives on a share: the picker hands out a
+        // content URI, and nothing but the ContentResolver can open one.
+        val picked = Uri.parse("content://media/external/video/media/9")
+        var resolverReads = 0
+        Shadows.shadowOf(context.contentResolver).registerInputStreamSupplier(picked) {
+            resolverReads++
+            ByteArrayInputStream(LEGACY_SUBRIP.toByteArray(StandardCharsets.ISO_8859_1))
+        }
+        val legacyResolver = resolverWith(FakePreferencesRepository(subtitleTextEncoding = "windows-1252"))
+
+        val configurations = legacyResolver.resolve(
+            mediaItem = mediaItemOf(videoUri.toString()),
+            savedExternalSubs = listOf(picked),
+        )
+
+        val saved = configurations.single { it.id == picked.toString() }
+        assertEquals("the picked subtitle has to be converted locally", "file", saved.uri.scheme)
+        assertEquals(LEGACY_SUBRIP, File(saved.uri.path!!).readText())
+        assertTrue(
+            "the picked subtitle has to be read through the ContentResolver",
+            resolverReads > 0,
+        )
+        assertEquals(
+            "only the subtitle that lives on the share is read through the network client",
+            listOf("Movies/Movie.srt" to 0L),
+            factory.clients.single().openStreamRequests,
         )
     }
 

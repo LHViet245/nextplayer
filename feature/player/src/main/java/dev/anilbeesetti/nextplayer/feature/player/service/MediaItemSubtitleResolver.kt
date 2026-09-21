@@ -37,6 +37,10 @@ import kotlinx.coroutines.CancellationException
  * A subtitle offered by more than one source is kept once, in the earliest position it appears in,
  * matched by its original URI rather than the converted one it is played from.
  *
+ * Where a video is looked up follows the video's own URI; where a subtitle is *read* follows the
+ * subtitle's. A subtitle picked from this device for a video on a share is still read by the
+ * ContentResolver, because that is the only thing that can open it.
+ *
  * Nothing here is allowed to keep the video from playing: a share that refuses a listing, a folder
  * that cannot be read, and a subtitle that cannot be opened each yield fewer subtitles rather than a
  * failed resolve. Cancellation is the one failure that is passed on — a resolve that stopped because
@@ -78,7 +82,7 @@ class MediaItemSubtitleResolver @Inject constructor(
 
         val discovered = (besideTheVideo + savedExternalSubs)
             .distinctBy(Uri::toString)
-            .mapNotNull { uri -> subtitleConfigurationOf(uri, isNetwork, subtitleEncoding) }
+            .mapNotNull { uri -> subtitleConfigurationOf(uri, subtitleEncoding) }
 
         val supplied = mediaItem.localConfiguration?.subtitleConfigurations ?: emptyList()
         return (supplied + discovered).distinctBy(::sourceUriOf)
@@ -115,16 +119,20 @@ class MediaItemSubtitleResolver @Inject constructor(
     /**
      * Converts one subtitle for playback, or null when it cannot be built at all.
      *
-     * A network subtitle is read through the client that plays its video — the only thing that can
-     * open an `smb://` stream — while a local or manually picked one keeps the ContentResolver path.
+     * Whether the bytes are read over the network is decided by the subtitle's own URI, not by where
+     * its video lives: an `smb://` subtitle is read through the client that plays the video — the only
+     * thing that can open such a stream — while everything else keeps the ContentResolver or URL path
+     * it has always used. A subtitle picked from this device for a video on a share is exactly that
+     * case: the picker hands out a `content://` URI that only the ContentResolver can open, and reading
+     * it through the network client would leave it unconverted.
+     *
      * The conversion is per subtitle so a single unreadable file costs its own track and no other.
      */
     private suspend fun subtitleConfigurationOf(
         uri: Uri,
-        isNetwork: Boolean,
         subtitleEncoding: String,
     ): MediaItem.SubtitleConfiguration? = runCatching {
-        val readThroughNetwork: (suspend () -> InputStream)? = if (isNetwork) {
+        val readThroughNetwork: (suspend () -> InputStream)? = if (NetworkUri.isNetworkUri(uri)) {
             { networkSubtitleResolver.openStream(uri) }
         } else {
             null
