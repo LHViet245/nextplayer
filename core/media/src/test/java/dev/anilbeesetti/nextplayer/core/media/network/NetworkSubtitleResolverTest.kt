@@ -24,8 +24,8 @@ import org.robolectric.RobolectricTestRunner
 /**
  * A subtitle next to a video has to be read through the client that is already playing the video,
  * so the session layer has to hand that client out instead of the caller opening its own
- * connection. These cover the session operation itself; the subtitle lookup built on top arrives
- * with the tests that follow this one.
+ * connection. The first tests cover that session operation; the rest cover the subtitle lookup
+ * built on top of it, which lists the video's own folder and has to stay quiet when it cannot.
  */
 @RunWith(RobolectricTestRunner::class)
 class NetworkSubtitleResolverTest {
@@ -42,13 +42,22 @@ class NetworkSubtitleResolverTest {
         name = "Other NAS",
         host = "192.168.1.20",
     )
-    private val connections = listOf(videoConnection, otherConnection)
+
+    /** A connection that names its port, so a subtitle URI can be checked for carrying it. */
+    private val portConnection = videoConnection.copy(
+        id = 3,
+        name = "Pinned port NAS",
+        host = "nas.local",
+        port = 445,
+    )
+    private val connections = listOf(videoConnection, otherConnection, portConnection)
 
     private val factory = FakeNetworkClientFactory()
     private val sessions = NetworkSessions(
         resolver = { id -> connections.firstOrNull { it.id == id } },
         clientFactory = factory,
     )
+    private val resolver = NetworkSubtitleResolver(sessions)
 
     private val videoUri = uriOf(videoConnection, "Movies/Movie.mkv")
     private val subtitleUri = uriOf(videoConnection, "Movies/Movie.srt")
@@ -113,6 +122,157 @@ class NetworkSubtitleResolverTest {
         assertEquals(1, factory.clients.single().connectCalls)
     }
 
+    @Test
+    fun `only subtitle siblings with the exact video name are discovered`() = runTest {
+        factory.files = listOf(
+            NetworkFile("Movie.srt", "Movies/Movie.srt", false),
+            NetworkFile("Movie.ASS", "Movies/Movie.ASS", false),
+            NetworkFile("OtherMovie.srt", "Movies/OtherMovie.srt", false),
+            NetworkFile("Movie.en.srt", "Movies/Movie.en.srt", false),
+            NetworkFile("Movie.vtt", "Movies/Movie.vtt", true),
+        )
+
+        val subtitles = resolver.findAdjacentSubtitles(videoUri)
+
+        assertEquals(
+            listOf(
+                uriOf(videoConnection, "Movies/Movie.ASS"),
+                uriOf(videoConnection, "Movies/Movie.srt"),
+            ),
+            subtitles,
+        )
+        assertEquals(
+            "the video's own folder is the only one listed",
+            listOf("Movies"),
+            factory.clients.single().listedPaths,
+        )
+    }
+
+    @Test
+    fun `every supported subtitle extension matches, ignoring case`() = runTest {
+        factory.files = listOf(
+            NetworkFile("movie.srt", "Movies/movie.srt", false),
+            NetworkFile("MOVIE.SSA", "Movies/MOVIE.SSA", false),
+            NetworkFile("Movie.Ass", "Movies/Movie.Ass", false),
+            NetworkFile("movie.vtt", "Movies/movie.vtt", false),
+            NetworkFile("movie.TTML", "Movies/movie.TTML", false),
+            // The video itself, a name that only starts like the video's, an extensionless file,
+            // and a file whose real extension is not a subtitle one.
+            NetworkFile("Movie.mkv", "Movies/Movie.mkv", false),
+            NetworkFile("Movie.srt.bak", "Movies/Movie.srt.bak", false),
+            NetworkFile("Movie", "Movies/Movie", false),
+            NetworkFile("Movie.txt", "Movies/Movie.txt", false),
+        )
+
+        val names = resolver.findAdjacentSubtitles(videoUri).map(Uri::getLastPathSegment)
+
+        assertEquals(
+            listOf("Movie.Ass", "movie.srt", "MOVIE.SSA", "movie.TTML", "movie.vtt"),
+            names,
+        )
+    }
+
+    @Test
+    fun `a subtitle the server lists twice is returned once`() = runTest {
+        factory.files = listOf(
+            NetworkFile("Movie.srt", "Movies/Movie.srt", false),
+            NetworkFile("Movie.srt", "Movies/Movie.srt", false),
+        )
+
+        val subtitles = resolver.findAdjacentSubtitles(videoUri)
+
+        assertEquals(listOf(uriOf(videoConnection, "Movies/Movie.srt")), subtitles)
+    }
+
+    @Test
+    fun `a video at the root of the share lists the root folder`() = runTest {
+        factory.files = listOf(
+            NetworkFile("Movie.srt", "Movie.srt", false),
+            NetworkFile("Other.srt", "Other.srt", false),
+        )
+
+        val subtitles = resolver.findAdjacentSubtitles(uriOf(videoConnection, "Movie.mkv"))
+
+        assertEquals(listOf(uriOf(videoConnection, "Movie.srt")), subtitles)
+        assertEquals(listOf(""), factory.clients.single().listedPaths)
+    }
+
+    @Test
+    fun `a subtitle uri keeps the scheme, host, port, encoded path and connection id`() = runTest {
+        factory.files = listOf(
+            NetworkFile("Épisode 1.srt", "Shows/My Show/Épisode 1.srt", false),
+        )
+
+        val subtitles = resolver.findAdjacentSubtitles(uriOf(portConnection, "Shows/My Show/Épisode 1.mkv"))
+
+        val subtitle = subtitles.single()
+        assertEquals("smb", subtitle.scheme)
+        assertEquals("nas.local", subtitle.host)
+        assertEquals(445, subtitle.port)
+        assertEquals("/Shows/My%20Show/%C3%89pisode%201.srt", subtitle.encodedPath)
+        assertEquals(portConnection.id.toString(), subtitle.getQueryParameter("cid"))
+        assertEquals(
+            "Shows/My Show/Épisode 1.srt",
+            NetworkUri.filePathOf(subtitle, NetworkProtocol.SMB),
+        )
+    }
+
+    @Test
+    fun `a failing listing is contained and yields no subtitles`() = runTest {
+        factory.files = listOf(NetworkFile("Movie.srt", "Movies/Movie.srt", false))
+        factory.listFilesFails = true
+
+        val subtitles = resolver.findAdjacentSubtitles(videoUri)
+
+        assertEquals(emptyList<Uri>(), subtitles)
+    }
+
+    @Test
+    fun `a connection that fails to connect yields no subtitles`() = runTest {
+        factory.failingConnectionIds = setOf(videoConnection.id)
+
+        val subtitles = resolver.findAdjacentSubtitles(videoUri)
+
+        assertEquals(emptyList<Uri>(), subtitles)
+    }
+
+    @Test
+    fun `a non-network uri yields no subtitles without opening a client`() = runTest {
+        val localUri = Uri.parse("content://media/external/video/media/42")
+
+        val subtitles = resolver.findAdjacentSubtitles(localUri)
+
+        assertEquals(emptyList<Uri>(), subtitles)
+        assertTrue("no connection should be created for a local video", factory.clients.isEmpty())
+    }
+
+    @Test
+    fun `openStream reads the subtitle through the client playing its video, at offset zero`() = runTest {
+        factory.files = listOf(NetworkFile("Movie.srt", "Movies/Movie.srt", false))
+        val subtitle = resolver.findAdjacentSubtitles(videoUri).single()
+
+        resolver.openStream(subtitle).close()
+
+        val client = factory.clients.single()
+        assertEquals(listOf("Movies/Movie.srt" to 0L), client.openStreamRequests)
+        assertEquals("the playing client is reused rather than reconnected", 1, client.connectCalls)
+    }
+
+    @Test
+    fun `an openStream failure reaches its caller and leaves discovery working`() = runTest {
+        factory.files = listOf(NetworkFile("Movie.srt", "Movies/Movie.srt", false))
+        val subtitle = resolver.findAdjacentSubtitles(videoUri).single()
+        factory.clients.single().openStreamFails = true
+
+        val failure = runCatching { resolver.openStream(subtitle) }
+
+        assertTrue(
+            "the open failure must reach whoever opens the subtitle",
+            failure.exceptionOrNull() is IOException,
+        )
+        assertEquals(1, resolver.findAdjacentSubtitles(videoUri).size)
+    }
+
     /**
      * `disconnect()` of a replaced connection is scheduled on [Dispatchers.IO] and deliberately not
      * awaited, so a test has to wait for it in real time rather than assume it already ran.
@@ -136,11 +296,13 @@ class NetworkSubtitleResolverTest {
 
 /**
  * Records what the session layer asks of a client, so a test can tell a reused client from a fresh
- * one and see that a replaced connection is really disconnected.
+ * one, see that a replaced connection is really disconnected, and see which folder a subtitle
+ * lookup listed or which file it opened.
  */
 class FakeNetworkClient(
     override val rootPath: String = "",
     private val connectSucceeds: Boolean = true,
+    /** What [listFiles] hands back, unless [listFilesFails] is set. */
     private val files: List<NetworkFile> = emptyList(),
     private val content: ByteArray = ByteArray(0),
 ) : NetworkClient {
@@ -153,6 +315,18 @@ class FakeNetworkClient(
         private set
     var openStreamCalls = 0
         private set
+
+    /** The paths [listFiles] was asked for, in call order. */
+    val listedPaths = mutableListOf<String>()
+
+    /** The path and offset [openStream] was asked for, in call order. */
+    val openStreamRequests = mutableListOf<Pair<String, Long>>()
+
+    /** Fails every listing, the way a connection that dropped mid-playback would. */
+    var listFilesFails = false
+
+    /** Fails every [openStream], the way an unreadable subtitle would. */
+    var openStreamFails = false
 
     private var connected = false
 
@@ -175,13 +349,20 @@ class FakeNetworkClient(
 
     override suspend fun listFiles(path: String): Result<List<NetworkFile>> {
         listFilesCalls++
-        return Result.success(files)
+        listedPaths += path
+        return if (listFilesFails) {
+            Result.failure(IOException("listing failed for $path"))
+        } else {
+            Result.success(files)
+        }
     }
 
     override suspend fun fileSize(path: String): Long = content.size.toLong()
 
     override suspend fun openStream(path: String, offset: Long): InputStream {
         openStreamCalls++
+        openStreamRequests += path to offset
+        if (openStreamFails) throw IOException("open failed for $path")
         return ByteArrayInputStream(content, offset.toInt(), content.size - offset.toInt())
     }
 }
@@ -194,8 +375,19 @@ class FakeNetworkClientFactory(
 
     val clients = mutableListOf<FakeNetworkClient>()
 
-    override fun create(connection: NetworkConnection): NetworkClient = FakeNetworkClient(
-        rootPath = connection.path,
-        connectSucceeds = connection.id !in failingConnectionIds,
-    ).also(clients::add)
+    /** The folder contents its clients hand back for whatever path they are asked to list. */
+    var files: List<NetworkFile> = emptyList()
+
+    /** Makes every client it creates fail its listing. */
+    var listFilesFails: Boolean = false
+
+    override fun create(connection: NetworkConnection): NetworkClient {
+        val client = FakeNetworkClient(
+            rootPath = connection.path,
+            connectSucceeds = connection.id !in failingConnectionIds,
+            files = files,
+        )
+        client.listFilesFails = listFilesFails
+        return client.also(clients::add)
+    }
 }
