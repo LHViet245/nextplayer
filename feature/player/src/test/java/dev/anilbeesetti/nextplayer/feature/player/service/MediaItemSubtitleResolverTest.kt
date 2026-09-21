@@ -2,6 +2,7 @@ package dev.anilbeesetti.nextplayer.feature.player.service
 
 import android.net.Uri
 import androidx.media3.common.MediaItem
+import androidx.media3.common.MediaMetadata
 import androidx.media3.common.MimeTypes
 import dev.anilbeesetti.nextplayer.core.data.repository.PreferencesRepository
 import dev.anilbeesetti.nextplayer.core.media.network.NetworkClient
@@ -14,6 +15,17 @@ import dev.anilbeesetti.nextplayer.core.model.NetworkConnection
 import dev.anilbeesetti.nextplayer.core.model.NetworkFile
 import dev.anilbeesetti.nextplayer.core.model.NetworkProtocol
 import dev.anilbeesetti.nextplayer.core.model.PlayerPreferences
+import dev.anilbeesetti.nextplayer.feature.player.extensions.audioDecoderMode
+import dev.anilbeesetti.nextplayer.feature.player.extensions.audioTrackIndex
+import dev.anilbeesetti.nextplayer.feature.player.extensions.playbackSpeed
+import dev.anilbeesetti.nextplayer.feature.player.extensions.positionMs
+import dev.anilbeesetti.nextplayer.feature.player.extensions.setExtras
+import dev.anilbeesetti.nextplayer.feature.player.extensions.subtitleDelayMilliseconds
+import dev.anilbeesetti.nextplayer.feature.player.extensions.subtitleSpeed
+import dev.anilbeesetti.nextplayer.feature.player.extensions.subtitleTrackIndex
+import dev.anilbeesetti.nextplayer.feature.player.extensions.videoDecoderMode
+import dev.anilbeesetti.nextplayer.feature.player.extensions.videoZoom
+import io.github.anilbeesetti.nextlib.media3ext.ffdecoder.DecoderMode
 import java.io.ByteArrayInputStream
 import java.io.File
 import java.io.IOException
@@ -84,6 +96,9 @@ class MediaItemSubtitleResolverTest {
 
     /** A subtitle that was added by hand, unrelated to any file beside the video. */
     private val pickedSubtitle = Uri.parse("content://media/external/video/media/7")
+
+    /** The thumbnail a network item is handed with, which the service keeps rather than extracts. */
+    private val artworkUri = Uri.parse("content://media/external/images/media/3")
 
     // Source selection.
 
@@ -357,6 +372,59 @@ class MediaItemSubtitleResolverTest {
         )
     }
 
+    // Enrichment as the service performs it.
+
+    @Test
+    fun `an smb video is enriched with the subtitles beside it and keeps everything else it came with`() =
+        runBlocking {
+            factory.files = listOf(NetworkFile("Movie.srt", "Movies/Movie.srt", false))
+            val item = itemCarryingMetadata(listOf(configurationOf(pickedSubtitle)))
+
+            val enriched = item.enrichedBy(
+                savedExternalSubs = listOf(externalEn),
+                localMediaPath = videoUri.toString(),
+            )
+
+            assertEquals(
+                "the item's own subtitle stays first, so a stored subtitle index still points at it",
+                listOf(pickedSubtitle.toString(), adjacentSrt.toString(), externalEn.toString()),
+                enriched.localConfiguration?.subtitleConfigurations?.map(MediaItem.SubtitleConfiguration::id),
+            )
+            assertEquals(
+                "the video's own folder is the only one looked in",
+                listOf("Movies"),
+                factory.clients.single().listedPaths,
+            )
+            assertEquals(videoUri.toString(), enriched.mediaId)
+            assertEquals(videoUri.toString(), enriched.localConfiguration?.uri?.toString())
+            assertMetadataUnchanged(enriched)
+        }
+
+    @Test
+    fun `an smb video whose share refuses the listing is still enriched, unchanged`() = runBlocking {
+        factory.listFilesFails = true
+        val item = itemCarryingMetadata(listOf(configurationOf(pickedSubtitle)))
+
+        val enriched = item.enrichedBy(
+            savedExternalSubs = listOf(externalEn),
+            localMediaPath = videoUri.toString(),
+        )
+
+        assertEquals(
+            "the share was asked for the video's folder, and refused it",
+            listOf("Movies"),
+            factory.clients.single().listedPaths,
+        )
+        assertEquals(
+            "no adjacent subtitle is added, but the item's own and the saved one survive",
+            listOf(pickedSubtitle.toString(), externalEn.toString()),
+            enriched.localConfiguration?.subtitleConfigurations?.map(MediaItem.SubtitleConfiguration::id),
+        )
+        assertEquals("the item still plays the video it came in with", videoUri.toString(), enriched.mediaId)
+        assertEquals(videoUri.toString(), enriched.localConfiguration?.uri?.toString())
+        assertMetadataUnchanged(enriched)
+    }
+
     private fun resolverWith(preferencesRepository: PreferencesRepository) = MediaItemSubtitleResolver(
         context = context,
         networkSubtitleResolver = networkSubtitleResolver,
@@ -390,8 +458,83 @@ class MediaItemSubtitleResolverTest {
         return File(folder, "Movie.mkv").also { it.writeText("video") }
     }
 
+    /**
+     * An item as the service receives one: already carrying the title, artwork and every piece of
+     * saved playback state it enriched from the database, plus the subtitle configurations the caller
+     * supplied. All of it has to survive enrichment untouched.
+     */
+    private fun itemCarryingMetadata(
+        subtitleConfigurations: List<MediaItem.SubtitleConfiguration>,
+    ): MediaItem = MediaItem.Builder()
+        .setUri(videoUri.toString())
+        .setMediaId(videoUri.toString())
+        .setSubtitleConfigurations(subtitleConfigurations)
+        .setMediaMetadata(
+            MediaMetadata.Builder()
+                .setTitle(MOVIE_TITLE)
+                .setArtworkUri(artworkUri)
+                .setExtras(
+                    positionMs = POSITION_MILLIS,
+                    videoScale = VIDEO_SCALE,
+                    playbackSpeed = PLAYBACK_SPEED,
+                    audioTrackIndex = AUDIO_TRACK_INDEX,
+                    subtitleTrackIndex = SUBTITLE_TRACK_INDEX,
+                    subtitleDelayMilliseconds = SUBTITLE_DELAY_MILLIS,
+                    subtitleSpeed = SUBTITLE_SPEED,
+                    videoDecoderMode = DecoderMode.FFMPEG,
+                    audioDecoderMode = DecoderMode.SOFTWARE,
+                )
+                .build(),
+        )
+        .build()
+
+    /**
+     * The enrichment the service performs on every item before handing it to the player: ask for the
+     * item's subtitles, put them on the item, carry everything else over.
+     *
+     * [localMediaPath] is what the caller stored as the item's path, which for a video on a share is
+     * its own URI; it must not send a network video looking at the filesystem.
+     */
+    private suspend fun MediaItem.enrichedBy(
+        savedExternalSubs: List<Uri>,
+        localMediaPath: String,
+    ): MediaItem {
+        val subtitleConfigurations = resolver.resolve(
+            mediaItem = this,
+            savedExternalSubs = savedExternalSubs,
+            localMediaPath = localMediaPath,
+        )
+        return buildUpon().setSubtitleConfigurations(subtitleConfigurations).build()
+    }
+
+    /** Asserts, value by value, that enrichment left every non-subtitle piece of the item alone. */
+    private fun assertMetadataUnchanged(enriched: MediaItem) {
+        val metadata = enriched.mediaMetadata
+        assertEquals(MOVIE_TITLE, metadata.title)
+        assertEquals(artworkUri, metadata.artworkUri)
+        assertEquals(POSITION_MILLIS, metadata.positionMs)
+        assertEquals(VIDEO_SCALE, metadata.videoZoom)
+        assertEquals(PLAYBACK_SPEED, metadata.playbackSpeed)
+        assertEquals(AUDIO_TRACK_INDEX, metadata.audioTrackIndex)
+        assertEquals(SUBTITLE_TRACK_INDEX, metadata.subtitleTrackIndex)
+        assertEquals(SUBTITLE_DELAY_MILLIS, metadata.subtitleDelayMilliseconds)
+        assertEquals(SUBTITLE_SPEED, metadata.subtitleSpeed)
+        assertEquals(DecoderMode.FFMPEG, metadata.videoDecoderMode)
+        assertEquals(DecoderMode.SOFTWARE, metadata.audioDecoderMode)
+    }
+
     private companion object {
         const val LISTING_TIMEOUT_MILLIS = 100L
+
+        /** Distinguishable values, so a swapped pair of metadata fields cannot pass unnoticed. */
+        const val MOVIE_TITLE = "Movie.mkv"
+        const val POSITION_MILLIS = 42_000L
+        const val VIDEO_SCALE = 1.25f
+        const val PLAYBACK_SPEED = 1.5f
+        const val AUDIO_TRACK_INDEX = 3
+        const val SUBTITLE_TRACK_INDEX = 4
+        const val SUBTITLE_DELAY_MILLIS = -250L
+        const val SUBTITLE_SPEED = 0.75f
 
         /** A UTF-8 subscript the charset detector recognises without a configured encoding. */
         const val SUBRIP_UTF8: String =

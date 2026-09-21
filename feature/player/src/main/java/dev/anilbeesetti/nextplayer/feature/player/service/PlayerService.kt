@@ -42,8 +42,6 @@ import dagger.hilt.android.AndroidEntryPoint
 import dev.anilbeesetti.nextplayer.core.common.Logger
 import dev.anilbeesetti.nextplayer.core.common.extensions.deleteFiles
 import dev.anilbeesetti.nextplayer.core.common.extensions.getFilenameFromUri
-import dev.anilbeesetti.nextplayer.core.common.extensions.getLocalSubtitles
-import dev.anilbeesetti.nextplayer.core.common.extensions.getPath
 import dev.anilbeesetti.nextplayer.core.common.extensions.subtitleCacheDir
 import dev.anilbeesetti.nextplayer.core.data.repository.MediaRepository
 import dev.anilbeesetti.nextplayer.core.data.repository.PreferencesRepository
@@ -77,7 +75,6 @@ import io.github.anilbeesetti.nextlib.media3ext.ffdecoder.DecoderMode
 import io.github.anilbeesetti.nextlib.media3ext.ffdecoder.NextRenderersFactory
 import io.github.anilbeesetti.nextlib.media3ext.renderer.subtitleDelayMilliseconds
 import io.github.anilbeesetti.nextlib.media3ext.renderer.subtitleSpeed
-import java.io.File
 import javax.inject.Inject
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
@@ -112,6 +109,9 @@ class PlayerService : MediaSessionService() {
 
     @Inject
     lateinit var imageLoader: ImageLoader
+
+    @Inject
+    lateinit var mediaItemSubtitleResolver: MediaItemSubtitleResolver
 
     private val playerPreferences: PlayerPreferences
         get() = preferencesRepository.playerPreferences.value
@@ -776,23 +776,13 @@ class PlayerService : MediaSessionService() {
                 val video = if (isNetwork) null else mediaRepository.getVideoByUri(uri = mediaItem.mediaId)
                 val videoState = mediaRepository.getVideoState(uri = mediaItem.mediaId)
 
-                val externalSubs = videoState?.externalSubs ?: emptyList()
-                val localSubs = if (!isNetwork) {
-                    (videoState?.path ?: getPath(uri))?.let {
-                        File(it).getLocalSubtitles(
-                            context = this@PlayerService,
-                            excludeSubsList = externalSubs,
-                        )
-                    } ?: emptyList()
-                } else emptyList()
-
-                val existingSubConfigurations = mediaItem.localConfiguration?.subtitleConfigurations ?: emptyList()
-                val subConfigurations = (localSubs + externalSubs).map { subtitleUri ->
-                    uriToSubtitleConfiguration(
-                        uri = subtitleUri,
-                        subtitleEncoding = playerPreferences.subtitleTextEncoding,
-                    )
-                }
+                // Which subtitles this item plays with, and in what order, is the resolver's decision:
+                // its own, then the ones beside the video, then the ones the user added by hand.
+                val subtitleConfigurations = mediaItemSubtitleResolver.resolve(
+                    mediaItem = mediaItem,
+                    savedExternalSubs = videoState?.externalSubs.orEmpty(),
+                    localMediaPath = videoState?.path,
+                )
 
                 // Local items get a placeholder now and their real artwork in the background;
                 // network items have no thumbnail to extract, so keep any supplied artwork.
@@ -812,7 +802,7 @@ class PlayerService : MediaSessionService() {
                 val subtitleSpeed = mediaItem.mediaMetadata.subtitleSpeed ?: videoState?.subtitleSpeed
 
                 mediaItem.buildUpon().apply {
-                    setSubtitleConfigurations(existingSubConfigurations + subConfigurations)
+                    setSubtitleConfigurations(subtitleConfigurations)
                     setMediaMetadata(
                         MediaMetadata.Builder().apply {
                             setTitle(title)
