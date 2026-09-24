@@ -53,6 +53,7 @@ suspend fun Context.uriToSubtitleConfiguration(
     uri: Uri,
     subtitleEncoding: String = "",
     isSelected: Boolean = false,
+    language: String? = null,
     openInputStream: (suspend () -> InputStream)? = null,
 ): MediaItem.SubtitleConfiguration {
     val charset = if (subtitleEncoding.isNotEmpty() && Charset.isSupported(subtitleEncoding)) {
@@ -71,6 +72,7 @@ suspend fun Context.uriToSubtitleConfiguration(
         setId(uri.toString())
         setMimeType(mimeType)
         setLabel(label)
+        if (language != null) setLanguage(language)
         if (isSelected) setSelectionFlags(C.SELECTION_FLAG_DEFAULT)
     }.build()
 }

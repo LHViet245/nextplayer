@@ -206,6 +206,33 @@ class MediaItemSubtitleResolverTest {
         )
     }
 
+    @Test
+    fun `an smb video discovers adjacent language suffixed subtitles and assigns their language`() = runBlocking {
+        factory.files = listOf(
+            NetworkFile("SNOS-393.mp4", "Movies/SNOS-393.mp4", false),
+            NetworkFile("SNOS-393.ja.srt", "Movies/SNOS-393.ja.srt", false),
+            NetworkFile("SNOS-393.vi.srt", "Movies/SNOS-393.vi.srt", false),
+        )
+
+        val snosVideo = NetworkUri.build(connection, "Movies/SNOS-393.mp4")
+        val snosJaSub = NetworkUri.build(connection, "Movies/SNOS-393.ja.srt")
+        val snosViSub = NetworkUri.build(connection, "Movies/SNOS-393.vi.srt")
+
+        val configurations = resolver.resolve(
+            mediaItem = mediaItemOf(snosVideo.toString()),
+            savedExternalSubs = emptyList(),
+        )
+
+        assertEquals(
+            listOf(snosJaSub.toString(), snosViSub.toString()),
+            configurations.map(MediaItem.SubtitleConfiguration::id),
+        )
+        assertEquals(
+            listOf("jpn", "vie"),
+            configurations.map { it.language },
+        )
+    }
+
     // Ordering and deduplication.
 
     @Test

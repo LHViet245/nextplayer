@@ -130,12 +130,13 @@ class NetworkSubtitleResolverTest {
     }
 
     @Test
-    fun `only subtitle siblings with the exact video name are discovered`() = runTest {
+    fun `subtitle siblings including language suffixed ones are discovered`() = runTest {
         factory.files = listOf(
             NetworkFile("Movie.srt", "Movies/Movie.srt", false),
             NetworkFile("Movie.ASS", "Movies/Movie.ASS", false),
             NetworkFile("OtherMovie.srt", "Movies/OtherMovie.srt", false),
             NetworkFile("Movie.en.srt", "Movies/Movie.en.srt", false),
+            NetworkFile("Movie.720p.srt", "Movies/Movie.720p.srt", false),
             NetworkFile("Movie.vtt", "Movies/Movie.vtt", true),
         )
 
@@ -144,6 +145,7 @@ class NetworkSubtitleResolverTest {
         assertEquals(
             listOf(
                 uriOf(videoConnection, "Movies/Movie.ASS"),
+                uriOf(videoConnection, "Movies/Movie.en.srt"),
                 uriOf(videoConnection, "Movies/Movie.srt"),
             ),
             subtitles,
@@ -152,6 +154,25 @@ class NetworkSubtitleResolverTest {
             "the video's own folder is the only one listed",
             listOf("Movies"),
             factory.clients.single().listedPaths,
+        )
+    }
+
+    @Test
+    fun `discovers language suffixed subtitles like vietnamese and japanese`() = runTest {
+        factory.files = listOf(
+            NetworkFile("SNOS-393.mp4", "Movies/SNOS-393.mp4", false),
+            NetworkFile("SNOS-393.ja.srt", "Movies/SNOS-393.ja.srt", false),
+            NetworkFile("SNOS-393.vi.srt", "Movies/SNOS-393.vi.srt", false),
+        )
+
+        val subtitles = resolver.findAdjacentSubtitles(uriOf(videoConnection, "Movies/SNOS-393.mp4"))
+
+        assertEquals(
+            listOf(
+                uriOf(videoConnection, "Movies/SNOS-393.ja.srt"),
+                uriOf(videoConnection, "Movies/SNOS-393.vi.srt"),
+            ),
+            subtitles,
         )
     }
 

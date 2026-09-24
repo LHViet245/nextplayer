@@ -7,6 +7,7 @@ import androidx.media3.common.MediaItem
 import dagger.hilt.android.qualifiers.ApplicationContext
 import dev.anilbeesetti.nextplayer.core.common.extensions.getLocalSubtitles
 import dev.anilbeesetti.nextplayer.core.common.extensions.getPath
+import dev.anilbeesetti.nextplayer.core.common.subtitles.SubtitleSiblings
 import dev.anilbeesetti.nextplayer.core.data.repository.PreferencesRepository
 import dev.anilbeesetti.nextplayer.core.media.network.NetworkSubtitleResolver
 import dev.anilbeesetti.nextplayer.core.media.network.NetworkUri
@@ -80,9 +81,20 @@ class MediaItemSubtitleResolver @Inject constructor(
             adjacentLocalSubtitles(localMediaPath, mediaUri, savedExternalSubs)
         }
 
+        val videoFileName = if (isNetwork) {
+            mediaUri.lastPathSegment.orEmpty()
+        } else {
+            val path = localMediaPath ?: context.getPath(mediaUri)
+            path?.let { File(it).name } ?: mediaUri.lastPathSegment.orEmpty()
+        }
+
         val discovered = (besideTheVideo + savedExternalSubs)
             .distinctBy(Uri::toString)
-            .mapNotNull { uri -> subtitleConfigurationOf(uri, subtitleEncoding) }
+            .mapNotNull { uri ->
+                val subtitleFileName = uri.lastPathSegment.orEmpty()
+                val language = SubtitleSiblings.match(videoFileName, subtitleFileName)?.languageCode
+                subtitleConfigurationOf(uri, subtitleEncoding, language)
+            }
 
         val supplied = mediaItem.localConfiguration?.subtitleConfigurations ?: emptyList()
         return (supplied + discovered).distinctBy(::sourceUriOf)
@@ -131,6 +143,7 @@ class MediaItemSubtitleResolver @Inject constructor(
     private suspend fun subtitleConfigurationOf(
         uri: Uri,
         subtitleEncoding: String,
+        language: String? = null,
     ): MediaItem.SubtitleConfiguration? = runCatching {
         val readThroughNetwork: (suspend () -> InputStream)? = if (NetworkUri.isNetworkUri(uri)) {
             { networkSubtitleResolver.openStream(uri) }
@@ -140,6 +153,7 @@ class MediaItemSubtitleResolver @Inject constructor(
         context.uriToSubtitleConfiguration(
             uri = uri,
             subtitleEncoding = subtitleEncoding,
+            language = language,
             openInputStream = readThroughNetwork,
         )
     }.getOrElse { if (it is CancellationException) throw it else null }
