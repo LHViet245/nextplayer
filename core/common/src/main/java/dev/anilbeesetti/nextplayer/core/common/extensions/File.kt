@@ -4,19 +4,19 @@ import android.content.Context
 import android.net.Uri
 import android.os.Environment
 import androidx.core.net.toUri
+import dev.anilbeesetti.nextplayer.core.common.subtitles.SubtitleSiblings
 import java.io.File
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 
 suspend fun File.getSubtitles(): List<File> = withContext(Dispatchers.IO) {
-    val mediaName = this@getSubtitles.nameWithoutExtension
-    val parentDir = this@getSubtitles.parentFile
-    val subtitleExtensions = listOf("srt", "ssa", "ass", "vtt", "ttml")
+    val parentDir = this@getSubtitles.parentFile ?: return@withContext emptyList()
+    val videoName = this@getSubtitles.name
 
-    subtitleExtensions.mapNotNull { extension ->
-        val file = File(parentDir, "$mediaName.$extension")
-        file.takeIf { it.exists() && it.isFile }
-    }
+    parentDir.listFiles()
+        ?.filter { it.isFile && SubtitleSiblings.match(videoName, it.name) != null }
+        ?.sortedBy { it.name.lowercase() }
+        ?: emptyList()
 }
 
 suspend fun File.getLocalSubtitles(
